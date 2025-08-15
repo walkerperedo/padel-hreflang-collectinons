@@ -1,7 +1,7 @@
-import collectionController from './controllers/collection.js'
 import express from 'express'
 import dotenv from 'dotenv'
 import cors from 'cors'
+import hreflangRoutes from './routes/hreflangRoutes.js'
 import { logger } from './utils/logger.js'
 
 dotenv.config()
@@ -12,7 +12,7 @@ app.use(express.json())
 app.use(express.urlencoded({ extended: true }))
 app.use(cors())
 
-app.use('/api', collectionController)
+app.use('/api', hreflangRoutes)
 
 app.get('/', (req, res) => {
   res.json({ status: 'API is running on /api' });

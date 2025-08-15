@@ -1,86 +1,127 @@
-import { createAdminApiClient } from '@shopify/admin-api-client'
-import { createStorefrontApiClient } from '@shopify/storefront-api-client'
-import { GET_COLLECTION_URL } from '../queries/getCollectionUrl.js'
+import { seoUtils } from '../utils/seoUtils.js'
 import { logger } from '../utils/logger.js'
-import * as cheerio from 'cheerio'
-import fetch from 'node-fetch'
-import dotenv from 'dotenv'
-import { updateMetafields } from '../queries/index.js'
-dotenv.config()
+import pLimit from 'p-limit'
 
-const adminClient = createAdminApiClient({
-  storeDomain: process.env.STORE_DOMAIN,
-  apiVersion: process.env.API_VERSION,
-  accessToken: process.env.ADMIN_ACCESS_TOKEN,
-})
+export class HreflangService {
+  constructor({ collectionRepo }) {
+    this.collectionRepo = collectionRepo
+  }
 
-const storeFrontClient = createStorefrontApiClient({
-  storeDomain: process.env.STORE_DOMAIN,
-  apiVersion: process.env.API_VERSION,
-  publicAccessToken: process.env.STORE_FRONT_TOKEN,
-})
+  async updateHrefLang(collectionId) {
+    try {
+      // 1. Get collection URL
+      const collectionUrl = await this.collectionRepo.getCollectionUrl(collectionId)
+      if (!collectionUrl) throw new Error(`Collection URL not found for ${collectionId}`)
 
-async function getHreflangs(url) {
-  const response = await fetch(url)
-  const html = await response.text()
-  const $ = cheerio.load(html)
+      // 2. Extract hreflangs
+      const hreflangs = await seoUtils.getHreflangs(collectionUrl)
 
-  const hreflangs = []
-  $('link[rel="alternate"][hreflang]').each((_, elem) => {
-    hreflangs.push({
-      hreflang: $(elem).attr('hreflang'),
-      href: $(elem).attr('href'),
-    })
-  })
-  return hreflangs
-}
+      // 3. Filter hreflangs with noindex/nofollow
+      const invalidLangs = []
+      for (const { hreflang, href } of hreflangs) {
+        const hasNoindex = await seoUtils.hasNoindexNofollow(href)
+        if (hasNoindex && hreflang !== 'x-default') {
+          invalidLangs.push(hreflang.toLowerCase())
+        }
+      }
 
-async function hasNoindexNofollow(url) {
-  try {
-    const response = await fetch(url)
-    const html = await response.text()
-    const $ = cheerio.load(html)
+      // 4. Update Shopify metafield
+      await this.collectionRepo.updateMetafields(collectionId, invalidLangs)
 
-    const robotsMeta = $('meta[name="robots"]').attr('content')
-    if (!robotsMeta) return false
+      return invalidLangs
+    } catch (error) {
+      logger.error(`Failed to update hreflangs for collection ${collectionId}`, error)
+      throw error
+    }
+  }
 
-    const normalized = robotsMeta.toLowerCase().replace(/\s+/g, '')
-    return normalized.includes('noindex') || normalized.includes('nofollow')
-  } catch (err) {
-    console.error(`Error checking ${url}:`, err)
-    return false
+  async updateAllHrefLangs() {
+    try {
+      let collectionsProcessed = 0
+      const allCollectionData = []
+
+      // 1. Get first batch
+      const { collectionData, totalCount, endCursor: initialCursor } = await this.collectionRepo.getAllCollections()
+      allCollectionData.push(...collectionData)
+      collectionsProcessed += collectionData.length
+
+      let cursor = initialCursor
+
+      // 2. Fetch remaining batches
+      while (collectionsProcessed < totalCount && cursor) {
+        const { collectionData, endCursor: nextCursor } = await this.collectionRepo.getAllCollections(cursor)
+        allCollectionData.push(...collectionData)
+        collectionsProcessed += collectionData.length
+
+        if (!nextCursor || nextCursor === cursor) break // Prevent infinite loop
+        cursor = nextCursor
+      }
+
+      if (allCollectionData.length === 0) throw new Error('No collections found')
+
+      logger.info(`Total collections to process: ${allCollectionData.length}`)
+      // ===========================================================================
+
+      const limit = pLimit(1)
+      const failedCollections = []
+
+      // 3. Map collections to tasks
+      const tasks = allCollectionData.map(({ collectionUrl, id }) => {
+        return limit(async () => {
+          try {
+            console.log(`Processing collection URL: ${collectionUrl} with ID: ${id}`)
+            const hreflangs = await seoUtils.getHreflangs(collectionUrl)
+
+            const hreflangLimit = pLimit(3)
+            const invalidHreflangs = new Set()
+            let rateLimitHit = false
+
+            await Promise.allSettled(
+              hreflangs.map(({ hreflang, href }) =>
+                hreflangLimit(async () => {
+                  try {
+                    const hasNoindex = await seoUtils.hasNoindexNofollow(href)
+                    if (hasNoindex && hreflang !== 'x-default') {
+                      invalidHreflangs.add(hreflang.toLowerCase())
+                    }
+                  } catch (error) {
+                    if (err.message?.startsWith('RATE_LIMIT_429')) {
+                      rateLimitHit = true
+                    } else {
+                      throw err
+                    }
+                  }
+                })
+              )
+            )
+
+            if (rateLimitHit) {
+              failedCollections.push({ collectionUrl, id })
+              console.log(`Skipping update for ${collectionUrl} due to rate limit`)
+              return
+            }
+
+            console.log(`Invalid hreflangs for ${collectionUrl}: ${Array.from(invalidHreflangs).join(', ')}`)
+
+            await this.collectionRepo.updateMetafields(id, Array.from(invalidHreflangs))
+            logger.info(
+              `------------------------------------------------Updated metafields for collection ${collectionUrl} with ID: ${id}-----------------------------------------`
+            )
+          } catch (error) {
+            failedCollections.push({ collectionUrl, id })
+            console.log(error)
+            logger.error(`Failed to process collection URL ${collectionUrl}`, error)
+          }
+        })
+      })
+      // 4. Execute all tasks
+      await Promise.all(tasks)
+
+      logger.info('All collections processed')
+      return failedCollections
+    } catch (error) {
+      logger.error('Failed to update all hreflangs', error)
+      throw error
+    }
   }
 }
-
-const updateHrefLang = async (collectionId) => {
-  const variables = { id: collectionId }
-  const { data, errors } = await storeFrontClient.request(GET_COLLECTION_URL, { variables })
-
-  if (errors) {
-    logger.error('Error fetching collection URL:', errors)
-    return Promise.reject(errors)
-  }
-
-  const collectionUrl = data.collection.onlineStoreUrl
-
-  const hreflangs = await getHreflangs(collectionUrl)
-  const results = []
-  for (const { hreflang, href } of hreflangs) {
-    const hasNoindex = await hasNoindexNofollow(href)
-    if (hasNoindex && hreflang !== 'x-default') results.push({ hreflang: hreflang.toLowerCase(), href: href.toLowerCase() })
-  }
-
-  const hrefs = results.map(({ hreflang }) => hreflang)
-  const vars = {
-    id: collectionId,
-    value: JSON.stringify(hrefs),
-  }
-  console.log("variabales", vars)
-  const { data: mutationData, errors: mutationErrors } = await adminClient.request(updateMetafields, { variables: vars })
-
-  console.log('Data from updateMetafields:', mutationData.collectionUpdate.collection.metafield)
-  console.log('Errors from updateMetafields:', mutationErrors)
-  return hrefs
-}
-
-export { updateHrefLang }
